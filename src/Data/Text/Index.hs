@@ -1,5 +1,14 @@
 {-# LANGUAGE StandaloneDeriving #-}
-module Data.Text.Index where
+module Data.Text.Index
+  (
+    Index
+  
+  , lookup,Weight
+  
+  , empty
+  , addDocument
+  , removeDocument
+  )where
 
 
 import           Data.Foldable   (foldMap,for_)
@@ -16,7 +25,7 @@ import qualified Data.Text.ICU.Normalize as ICU
 import qualified Data.TST                as TST
 import           Data.TST        (TST)
 import           GHC.Generics    (Generic)
-import           Prelude hiding (lookup,words)
+import           Prelude hiding (lookup,words,Word)
 
 
 -- Types.
