@@ -3,18 +3,22 @@ module Data.Text.Index
   (
     Index
   
-  , lookup,Weight
+  , lookupWord
+  , lookupPhrase
+  , Weight, toDouble
+  , size
   
   , empty
   , addDocument
   , removeDocument
   )where
 
+import qualified Data.Search.Results as Results
 
-import           Data.Foldable   (foldMap,for_)
+import           Data.Foldable   (foldMap, for_)
 import           Data.Functor    ((<$>))
-import           Data.List       (foldl')
-import           Data.Monoid     (Endo(Endo,appEndo))
+import           Data.List       (foldl', sortOn, intercalate)
+import           Data.Monoid     ((<>), Endo(Endo, appEndo))
 import           Data.Ord        (Down(Down))
 import qualified Data.OrdPSQ             as PSQ
 import qualified Data.Text               as Text
@@ -24,58 +28,85 @@ import qualified Data.Text.ICU.Char      as ICU
 import qualified Data.Text.ICU.Normalize as ICU
 import qualified Data.TST                as TST
 import           Data.TST        (TST)
+import           Data.Typeable   (Typeable)
 import           GHC.Generics    (Generic)
-import           Prelude hiding (lookup,words,Word)
+import           Prelude hiding (lookup, words, Word)
 
 
--- Types.
+-- TODO: exact matches within long strings are not found right now (unless
+-- the start of the match happens to coincide with a chunk boundary).
 
+-- The index contains many (trimmed-down) variants of all source words.
 type Index id
   = TST Char (Entries id)
 
+-- For a given variant (this is a leaf of the TST), we have a set
+-- of original words, together with the source id, and its weight (indicating
+-- how much the original word was trimmed).
 type Entries id
-  = PSQ.OrdPSQ id (Down Weight) Word
+  = PSQ.OrdPSQ id Weight Word
 
+-- A 'Word' does not contain spaces.
 type Word
   = Text
 
-type Weight
-  = Double
+newtype Weight
+  = Weight Double
+  deriving (Eq, Show, Typeable)
+
+toDouble :: Weight -> Double
+toDouble (Weight d) = d
+
+instance Monoid Weight where
+  mappend (Weight a) (Weight b) = Weight $ a + b
+  mempty = Weight 0
+
+reweigh :: (Double -> Double) -> Weight -> Weight
+reweigh f (Weight d) = Weight (f d)
+
+instance Ord Weight where
+  compare (Weight a) (Weight b) = compare a b
 
 -- Lookup.
 
-lookupExact :: (Ord id) => Int -> Word -> Index id -> [(id,Down Weight,Word)]
-lookupExact n t index = case TST.lookup (realChars t) index of
-  Just entries -> PSQ.takeMin n entries
-  Nothing      -> []
+lookupExact :: (Ord id) =>
+  Index id -> Word -> Results.T id Weight Word
+lookupExact index t = case TST.lookup (realChars t) index of
+  Just entries -> Results.fromPSQ entries
+  Nothing      -> Results.empty
 
-lookup :: (Ord id) => Int -> Word -> Index id -> [(id,Weight,Word)]
-lookup n t index = map (\ (i,Down w,t') -> (i,w,t')) .
-  PSQ.takeMin n . psqUnions $ map f variations
+lookupWord :: (Ord id) =>
+  Index id -> Word -> Results.T id Weight Word
+lookupWord index t = Results.union $ map f variations
  where
-  f (t',w) = PSQ.fromList $ map (\ (i,Down w',t'') -> (i,Down $ w + w',t'')) $ lookupExact n t' index
-  variations = deletions defaultWeights (normalise t,0)
+  f (t', w) = Results.changeWeight (w <>) $
+    lookupExact index t'
+  variations = deletions defaultWeights =<< chop (normalise t)
 
-psqUnions :: (Ord k,Ord p) => [PSQ.OrdPSQ k p v] -> PSQ.OrdPSQ k p v
-psqUnions = foldl' psqUnion PSQ.empty where
-  psqUnion big small = foldl'
-    (\ psq (k,p,v) -> PSQ.insertWith combine k p v psq)
-    big
-    $ PSQ.toList small
-  combine _ (p₁,v₁) (p₂,v₂)
-    | p₁ <= p₂  = (p₁,v₁)
-    | otherwise = (p₂,v₂)
+lookupPhrase :: (Ord id) => Index id -> Text -> Results.T id Weight Word
+lookupPhrase index t = case words t of
+  -- Empty search term gives no results. Do we want a way
+  -- to return all results?
+  []    -> Results.empty
+  terms -> Results.intersection $ map (lookupWord index) terms
+
+size :: Index id -> Int
+size = length . TST.toList
 
 -- Creation.
 
 empty :: Index id
 empty = TST.empty
 
-addVariant :: (Ord id) => id -> Word -> (Word,Weight) -> Index id -> Index id
-addVariant i original (variant,w) = TST.insertWith
-  (const $ PSQ.insert i (Down w) original)
+addVariant :: (Ord id) => id -> Word -> (Word, Weight) -> Index id -> Index id
+addVariant i original (variant, w) = TST.insertWith
+  (const $ snd . PSQ.alter f i)
   (realChars variant)
-  (PSQ.singleton i (Down w) original)
+  (PSQ.singleton i w original)
+ where
+  f (Just (w', original'))
+    | w' <= w = ((), Just (w', original'))
+  f _         = ((), Just (w , original ))
 
 addWord :: (Ord id) => id -> Word -> Index id -> Index id
 addWord i t = appEndo . foldMap (Endo . addVariant i t) $
@@ -96,43 +127,49 @@ normalise :: Text -> Text
 normalise = ICU.normalize ICU.NFKD . Text.toCaseFold
 
 weightedLength :: Weights -> Text -> Weight
-weightedLength wts = sum . map (character wts) . Text.unpack
+weightedLength wts = mconcat . map (character wts) . Text.unpack
 
-vary :: Weights -> Word -> [(Word,Weight)]
+-- Generate all variants of a word.
+-- Some of these contain holes, others are just shortened versions.
+vary :: Weights -> Word -> [(Word, Weight)]
 vary wts t = shorten wts =<< deletions wts =<< chop =<< [normalise t]
 
-shorten :: Weights -> (Word,Weight) -> [(Word,Weight)]
-shorten wts (t,w)
-  | w < -0.9  = [(t,w)]
-  | otherwise = (t,w) : concatMap
+shorten :: Weights -> (Word, Weight) -> [(Word, Weight)]
+shorten wts (t, w)
+  -- Non-trivial deletion variants of a word are not further shortened.
+  | w > Weight 0.9  = [(t, w)]
+  | otherwise       = (t, w) : concatMap
       (\ br -> weigh (ICU.brkPrefix br) ++ weigh (ICU.brkSuffix br))
       breaks
   where
+    -- Break up a string in characters.
     breaks = ICU.breaks (ICU.breakCharacter ICU.Current) t
     weigh st
       | Text.null st = []
-      | otherwise    = [(st,w - _N + weightedLength wts st)]
+      | otherwise    = [(st, w <> _N <> n)]
+     where
+      n  = reweigh negate $ weightedLength wts st
     _N = weightedLength wts t
 
-deletions :: Weights -> (Word,Weight) -> [(Word,Weight)]
-deletions wts (t,w) = step (t,w) where
-  minimalWeight = negate $ budget wts $ weightedLength wts t
-  step :: (Word,Weight) -> [(Word,Weight)]
-  step (t,w) = go t w 1 where
+deletions :: Weights -> (Word, Weight) -> [(Word, Weight)]
+deletions wts (t, w) = step (t, w) where
+  maximalWeight = budget wts $ weightedLength wts t
+  step :: (Word, Weight) -> [(Word, Weight)]
+  step (t, w) = go t w 1 where
     go t w start
-      | w < minimalWeight = []
-      | Text.null t       = [(t,w)]
-      | otherwise         = (t,w) : concatMap
+      | w > maximalWeight = []
+      | Text.null t       = [(t, w)]
+      | otherwise         = (t, w) : concatMap
           (delete w)
-          [(i,Text.splitAt i t) | i <- [start .. Text.length t]]
-    delete w (i,(leftC,right)) = go
+          [(i, Text.splitAt i t) | i <- [start .. Text.length t]]
+    delete w (i, (leftC, right)) = go
       (Text.append left (Text.cons hole right))
-      (w - cost)
+      (w <> cost)
       (succ i)
      where
       c = Text.last leftC
       left = Text.init leftC
-      cost = continuationCost * characterCost
+      cost = reweigh (continuationCost *) characterCost
       continuationCost
         | not (Text.null left) && Text.last left == hole = continuation wts
         | otherwise                                      = 1
@@ -140,7 +177,7 @@ deletions wts (t,w) = step (t,w) where
 
 data Weights
   = Weights
-    { continuation :: Weight
+    { continuation :: Double
     , character    :: Char -> Weight
     , budget       :: Weight -> Weight
     }
@@ -149,12 +186,12 @@ defaultWeights :: Weights
 defaultWeights = Weights
   { continuation = 0.75
   , character    = \ c -> case ICU.property ICU.GeneralCategory c of
-      ICU.NonSpacingMark       -> 0.2
-      ICU.EnclosingMark        -> 0.2
-      ICU.CombiningSpacingMark -> 0.2
-      ICU.OtherPunctuation     -> 0.4
-      _                        -> 1
-  , budget = min 2 . \ l -> 0.5 + l / 5
+      ICU.NonSpacingMark       -> Weight 0.2
+      ICU.EnclosingMark        -> Weight 0.2
+      ICU.CombiningSpacingMark -> Weight 0.2
+      ICU.OtherPunctuation     -> Weight 0.4
+      _                        -> Weight 1
+  , budget = reweigh $ min 2 . \ l -> 0.5 + l / 5
   }
 
 hole :: Char
@@ -168,22 +205,25 @@ realChars = filter (/= hole) . Text.unpack
 
 -- Dealing with long words.
 
-chop :: Word -> [(Word,Weight)]
+-- Chop up a word in overlapping chunks, of maximal length 15
+-- and typical length 10.
+chop :: Word -> [(Word, Weight)]
 chop t
-  | Text.length t < maximalChunk = [(t,0)]
-  | otherwise                    = map (flip (,) $ -1) $ chop' t
+  | Text.length t <= maximalChunk = [(t, Weight 0)]
+  | otherwise                     = (Text.take maximalChunk t, Weight 0) :
+      (map (flip (,) $ Weight 1) . chop' $ Text.drop overlap t)
   where
     chop' t
-      | Text.length t < maximalChunk = [t]
-      | otherwise                    = Text.take typicalChunk t : chop' (Text.drop overlap t)
+      | Text.length t <= maximalChunk = [t]
+      | otherwise                     = Text.take typicalChunk t : chop' (Text.drop overlap t)
     maximalChunk = 3 * overlap
     typicalChunk = 2 * overlap
     overlap      = 5
 
 -- Helper functions and tests.
 
-printVariations :: [(Word,Weight)] -> IO ()
-printVariations = mapM_ $ \ (t,w) -> do
+printVariations :: [(Word, Weight)] -> IO ()
+printVariations = mapM_ $ \ (t, w) -> do
   putStr (Text.unpack . showHoles $ t)
   putStrLn (" " ++ show w)
 

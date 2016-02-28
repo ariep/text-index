@@ -1,5 +1,5 @@
 name:                text-index
-version:             0.1.0.0
+version:             0.2.0.0
 -- synopsis:            
 -- description:         
 license:             BSD3
@@ -14,6 +14,7 @@ cabal-version:       >= 1.10
 
 library
   exposed-modules:
+    Data.Search.Results
     Data.Text.Index
   -- other-modules:       
   -- other-extensions:    
