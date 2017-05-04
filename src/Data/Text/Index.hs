@@ -1,17 +1,17 @@
 {-# LANGUAGE StandaloneDeriving #-}
 module Data.Text.Index
-  (
-    Index
-  
+  ( Index
+
   , lookupWord
   , lookupPhrase
   , Weight, toDouble
   , size
-  
+
   , empty
   , addDocument
+  , addDocumentParts
   , removeDocument
-  )where
+  ) where
 
 import qualified Data.Search.Results as Results
 
@@ -112,6 +112,9 @@ addWord :: (Ord id) => id -> Word -> Index id -> Index id
 addWord i t = appEndo . foldMap (Endo . addVariant i t) $
   vary defaultWeights t
 
+addDocumentParts :: (Ord id) => id -> [Text] -> Index id -> Index id
+addDocumentParts i = appEndo . foldMap (Endo . addDocument i)
+
 addDocument :: (Ord id) => id -> Text -> Index id -> Index id
 addDocument i = appEndo . foldMap (Endo . addWord i) . words
 
@@ -207,6 +210,8 @@ realChars = filter (/= hole) . Text.unpack
 
 -- Chop up a word in overlapping chunks, of maximal length 15
 -- and typical length 10.
+-- Words that do not need to be chopped have zero weight. Words that do get weight 1.
+-- This enables us to store less variations of long words in the index.
 chop :: Word -> [(Word, Weight)]
 chop t
   | Text.length t <= maximalChunk = [(t, Weight 0)]
@@ -232,3 +237,6 @@ testDocument = Text.pack "Dit is een hele zin, met allemaal woorden erin. Ook wo
 
 dr :: Text
 dr = Text.pack "driehoeksongelijkheid"
+
+to :: Text
+to = Text.pack "telefoonoplader"

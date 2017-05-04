@@ -1,6 +1,6 @@
 name:                text-index
 version:             0.2.0.0
--- synopsis:            
+synopsis:            In-memory text indexing for fast searching
 -- description:         
 license:             BSD3
 license-file:        LICENSE
