@@ -15,6 +15,7 @@ module Data.Text.Index
 
 import qualified Data.Search.Results as Results
 
+import qualified Data.Char.Properties.GeneralCategory as CharProp
 import           Data.Foldable   (foldMap, for_)
 import           Data.Functor    ((<$>))
 import           Data.List       (foldl', sortOn, intercalate)
@@ -23,14 +24,13 @@ import           Data.Ord        (Down(Down))
 import qualified Data.OrdPSQ             as PSQ
 import qualified Data.Text               as Text
 import           Data.Text       (Text)
-import qualified Data.Text.ICU           as ICU
-import qualified Data.Text.ICU.Char      as ICU
-import qualified Data.Text.ICU.Normalize as ICU
 import qualified Data.TST                as TST
 import           Data.TST        (TST)
 import           Data.Typeable   (Typeable)
 import           GHC.Generics    (Generic)
 import           Prelude hiding (lookup, words, Word)
+import qualified Prose.Segmentation.Words as Words
+import qualified Prose.Normalization.Text as Normalise
 
 
 -- TODO: exact matches within long strings are not found right now (unless
@@ -81,7 +81,7 @@ lookupWord index t = Results.union $ map f variations
  where
   f (t', w) = Results.changeWeight (w <>) $
     lookupExact index t'
-  variations = deletions defaultWeights =<< chop (normalise t)
+  variations = deletions defaultWeights =<< chop (compose t)
 
 lookupPhrase :: (Ord id) => Index id -> Text -> Results.T id Weight Word
 lookupPhrase index t = case words t of
@@ -122,12 +122,11 @@ removeDocument :: (Ord id) => id -> Index id -> Index id
 removeDocument i = fmap (PSQ.delete i)
 
 words :: Text -> [Text]
-words = map ICU.brkBreak .
-  filter ((/=) ICU.Uncategorized . ICU.brkStatus) .
-  ICU.breaks (ICU.breakWord ICU.Current)
+words = Words.segmentT
 
-normalise :: Text -> Text
-normalise = ICU.normalize ICU.NFKD . Text.toCaseFold
+compose, decompose :: Text -> Text
+compose = Normalise.composeC
+decompose = Normalise.decomposeKD
 
 weightedLength :: Weights -> Text -> Weight
 weightedLength wts = mconcat . map (character wts) . Text.unpack
@@ -135,24 +134,27 @@ weightedLength wts = mconcat . map (character wts) . Text.unpack
 -- Generate all variants of a word.
 -- Some of these contain holes, others are just shortened versions.
 vary :: Weights -> Word -> [(Word, Weight)]
-vary wts t = shorten wts =<< deletions wts =<< chop =<< [normalise t]
+vary wts t = shorten wts . first compose =<< deletions wts =<< chop =<< [decompose t]
+ where
+  first f (a, b) = (f a, b)
 
 shorten :: Weights -> (Word, Weight) -> [(Word, Weight)]
 shorten wts (t, w)
   -- Non-trivial deletion variants of a word are not further shortened.
   | w > Weight 0.9  = [(t, w)]
-  | otherwise       = (t, w) : concatMap
-      (\ br -> weigh (ICU.brkPrefix br) ++ weigh (ICU.brkSuffix br))
-      breaks
+  | otherwise       = (t, w) : concatMap weigh substrings
   where
     -- Break up a string in characters.
-    breaks = ICU.breaks (ICU.breakCharacter ICU.Current) t
+    substrings = splitEverywhere t
     weigh st
       | Text.null st = []
       | otherwise    = [(st, w <> _N <> n)]
      where
       n  = reweigh negate $ weightedLength wts st
     _N = weightedLength wts t
+
+splitEverywhere :: Text -> [Text]
+splitEverywhere t = drop 1 (init $ Text.inits t) ++ drop 1 (init $ Text.tails t)
 
 deletions :: Weights -> (Word, Weight) -> [(Word, Weight)]
 deletions wts (t, w) = step (t, w) where
@@ -188,12 +190,14 @@ data Weights
 defaultWeights :: Weights
 defaultWeights = Weights
   { continuation = 0.75
-  , character    = \ c -> case ICU.property ICU.GeneralCategory c of
-      ICU.NonSpacingMark       -> Weight 0.2
-      ICU.EnclosingMark        -> Weight 0.2
-      ICU.CombiningSpacingMark -> Weight 0.2
-      ICU.OtherPunctuation     -> Weight 0.4
-      _                        -> Weight 1
+  , character    = \ c -> case CharProp.gcMajorClass $ CharProp.getGeneralCategory c of
+      CharProp.ClLetter	     -> Weight 1
+      CharProp.ClMark        -> Weight 0.2
+      CharProp.ClNumber	     -> Weight 1
+      CharProp.ClSeparator   -> Weight 0.2
+      CharProp.ClPunctuation -> Weight 0.4
+      CharProp.ClSymbol      -> Weight 1
+      CharProp.ClOther       -> Weight 1
   , budget = reweigh $ min 2 . \ l -> 0.5 + l / 5
   }
 
